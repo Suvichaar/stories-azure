@@ -80,7 +80,7 @@ def generate_slug_and_urls(title):
 
 # ── Streamlit App ─────────────────────────────────────────────────
 def main():
-    st.title("Dynamic Story & Video Page Generator")
+    st.title("Generate your thoughts with Suvichaar")
     topic = st.text_input("Enter your topic:")
     language = st.selectbox("Select your Language", ["en-US", "hi"])
     if st.button("Generate Story + Video Page") and topic:
