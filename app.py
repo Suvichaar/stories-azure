@@ -2,6 +2,7 @@ import os
 import string
 import random
 import tempfile
+import base64
 from dotenv import load_dotenv
 import streamlit as st
 import json
@@ -17,7 +18,6 @@ from datetime import datetime, timezone
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────
-
 # Azure OpenAI
 AZURE_ENDPOINT = st.secrets["azure_openai"]["endpoint"]
 AZURE_API_KEY  = st.secrets["azure_openai"]["api_key"]
@@ -30,9 +30,9 @@ AWS_BUCKET     = st.secrets["aws"]["bucket"]
 S3_PREFIX      = st.secrets["aws"]["s3_prefix"]
 CDN_BASE       = st.secrets["aws"]["cdn_base"]
 IMAGE_FOLDER   = st.secrets["aws"]["image_folder"]
+IMAGE_FOLDER   = st.secrets["aws"]["CLOUDFRONT_BASE"]
 # Pexels
 PEXELS_API_KEY = st.secrets["pexels"]["api_key"]
-
 
 # ── Clients ────────────────────────────────────────────────────────
 client = AzureOpenAI(
@@ -49,7 +49,7 @@ s3 = boto3.client(
 
 # ── Load Templates ─────────────────────────────────────────────────
 prompt_template = Template(open("prompt_template.txt", "r", encoding="utf-8").read())
-html_template   = Template(open(r"templates/master_template_org_updated.html", "r", encoding="utf-8").read())
+html_template   = Template(open("templates/master_template_org_updated.html", "r", encoding="utf-8").read())
 
 # ── Helpers ────────────────────────────────────────────────────────
 def search_pexels_image(query, index):
@@ -59,8 +59,21 @@ def search_pexels_image(query, index):
     photos = requests.get(url, headers=headers, params=params).json().get("photos", [])
     return photos[index]["src"]["original"] if len(photos) > index else None
 
-def s3_image_url(key):
-    return f"{CDN_BASE}/{key}"
+def generate_resized_url(bucket: str, key: str, width: int, height: int, fit: str = "cover") -> str:
+    instructions = {
+        "bucket": bucket,
+        "key": key,
+        "edits": {
+            "resize": {
+                "width": width,
+                "height": height,
+                "fit": fit
+            }
+        }
+    }
+    payload = json.dumps(instructions).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(payload).decode("utf-8")
+    return f"{CLOUDFRONT_BASE}/{b64}"
 
 def generate_slug_and_urls(title):
     if not title or not isinstance(title, str):
@@ -80,7 +93,7 @@ def generate_slug_and_urls(title):
 
 # ── Streamlit App ─────────────────────────────────────────────────
 def main():
-    st.title("Generate your thoughts with Suvichaar")
+    st.title("Dynamic Story & Video Page Generator")
     topic = st.text_input("Enter your topic:")
     language = st.selectbox("Select your Language", ["en-US", "hi"])
     if st.button("Generate Story + Video Page") and topic:
@@ -107,7 +120,7 @@ def main():
                 "s10caption1":     video_row["{{s10caption1}}"],
             }
 
-            # 3️⃣ Fetch & upload images via Pexels into tempdir
+            # 3️⃣ Fetch, upload & generate resized URLs
             images = {f"s{i}image1": "" for i in range(1, 10)}
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 futures = {pool.submit(search_pexels_image, topic, i): i for i in range(9)}
@@ -116,47 +129,48 @@ def main():
                     if not url_img:
                         continue
 
-                    # write into system temp dir
+                    # download to temp, upload raw to S3
                     _, tmp_path = tempfile.mkstemp(prefix=f"tmp_{idx+1}_", suffix=".jpg")
                     os.close(_)
                     with open(tmp_path, "wb") as f:
                         f.write(requests.get(url_img).content)
 
-                    # upload via fileobj so we fully close before remove
                     s3_key = f"{IMAGE_FOLDER}/{topic.replace(' ', '_')}_{idx+1}.jpg"
                     with open(tmp_path, "rb") as f_in:
                         s3.upload_fileobj(f_in, AWS_BUCKET, s3_key)
-
-                    # now safe to remove
                     os.remove(tmp_path)
-                    images[f"s{idx+1}image1"] = s3_image_url(s3_key)
+
+                    # generate a 720×1280 resized URL via CloudFront
+                    images[f"s{idx+1}image1"] = generate_resized_url(
+                        bucket=AWS_BUCKET,
+                        key=s3_key,
+                        width=720,
+                        height=1280,
+                        fit="cover"
+                    )
 
             # 4️⃣ Compute timestamps, slug, and URLs
             now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
             _, slug_nano, canurl, html_filename = generate_slug_and_urls(data["storytitle"])
 
             raw_url = images.get("s1image1", "")
-            pot_image = raw_url.replace(
-                "https://cdn.suvichaar.org",
-                "https://media.suvichaar.org"
-            )
+            pot_image = raw_url  # already resized via CloudFront
 
             # 5️⃣ Merge everything and render HTML
             html_vars = {
                 **data,
                 **images,
                 **video_context,
-                "Topic":         topic,
-                "lang":          language,
-                "publishedtime": now_iso,
-                "modifiedtime":  now_iso,
-                "canurl":        canurl,
-                "potraightcoverurl":pot_image
+                "Topic":            topic,
+                "lang":             language,
+                "publishedtime":    now_iso,
+                "modifiedtime":     now_iso,
+                "canurl":           canurl,
+                "potraightcoverurl": pot_image
             }
-
             html_content = html_template.render(**html_vars)
 
-            # upload HTML to your S3 bucket
+            # upload final HTML
             s3.put_object(
                 Bucket="suvichaarstories",
                 Key=html_filename,
