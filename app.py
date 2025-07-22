@@ -33,6 +33,8 @@ S3_PREFIX      = st.secrets["aws"]["s3_prefix"]
 CDN_BASE       = st.secrets["aws"]["cdn_base"]
 IMAGE_FOLDER   = st.secrets["aws"]["image_folder"]
 CLOUDFRONT_BASE   = st.secrets["aws"]["CLOUDFRONT_BASE"]
+HTML_BUCKET      = st.secrets["aws"]["HTML_BUCKET"]   # bucket for HTML/JSON
+JSON_FOLDER      = st.secrets["aws"]["JSON_FOLDER"]
 # Pexels
 PEXELS_API_KEY = st.secrets["pexels"]["api_key"]
 
