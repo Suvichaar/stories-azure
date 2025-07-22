@@ -52,7 +52,7 @@ s3 = boto3.client(
 
 # ── Load Templates ─────────────────────────────────────────────────
 prompt_template = Template(open("prompt_template.txt", "r", encoding="utf-8").read())
-html_template   = Template(open("templates/master_template_org_updated.html", "r", encoding="utf-8").read())
+html_template   = Template(open("templates/master_template_org_update.html", "r", encoding="utf-8").read())
 
 # ── Helpers ────────────────────────────────────────────────────────
 def search_pexels_image(query, index):
