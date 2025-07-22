@@ -1,4 +1,5 @@
 import os
+import re
 import string
 import random
 import tempfile
@@ -13,6 +14,7 @@ import pandas as pd
 from jinja2 import Template
 from openai import AzureOpenAI
 from datetime import datetime, timezone
+from json.decoder import JSONDecodeError
 
 # ── Load .env ─────────────────────────────────────────────────────
 load_dotenv()
@@ -40,6 +42,7 @@ client = AzureOpenAI(
     azure_endpoint=AZURE_ENDPOINT,
     api_version="2025-01-01-preview"
 )
+
 s3 = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -55,7 +58,7 @@ html_template   = Template(open("templates/master_template_org_updated.html", "r
 def search_pexels_image(query, index):
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "per_page": index+1, "orientation": "portrait", "size": "medium"}
+    params = {"query": query, "per_page": index + 1, "orientation": "portrait", "size": "medium"}
     photos = requests.get(url, headers=headers, params=params).json().get("photos", [])
     return photos[index]["src"]["original"] if len(photos) > index else None
 
@@ -91,11 +94,33 @@ def generate_slug_and_urls(title):
         f"{slug_nano}.html"
     )
 
+def clean_filter_tags(data):
+    """Extract & normalize filter tags from model output."""
+    raw_tags = (
+        data.get("filterTags")
+        or data.get("filtertags")
+        or data.get("tags")
+        or data.get("metakeywords", "")
+    )
+    if isinstance(raw_tags, str):
+        raw_tags = [t.strip() for t in re.split(r"[,|;]", raw_tags) if t.strip()]
+    if not raw_tags:
+        return []
+    seen = set()
+    cleaned = []
+    for t in raw_tags:
+        key = t.lower()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(t)
+    return cleaned
+
 # ── Streamlit App ─────────────────────────────────────────────────
 def main():
     st.title("Dynamic Story & Video Page Generator")
     topic = st.text_input("Enter your topic:")
     language = st.selectbox("Select your Language", ["en-US", "hi"])
+
     if st.button("Generate Story + Video Page") and topic:
         with st.spinner("Generating story and picking a video..."):
             # 1️⃣ Generate content via Azure OpenAI
@@ -104,7 +129,20 @@ def main():
                 model="gpt-4",
                 messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}]
             )
-            data = json.loads(resp.choices[0].message.content)
+
+            # Parse JSON safely
+            raw_content = resp.choices[0].message.content
+            try:
+                data = json.loads(raw_content)
+            except JSONDecodeError:
+                # naive fallback: grab first {...} block
+                match = re.search(r"\{.*\}", raw_content, flags=re.S)
+                if not match:
+                    st.error("Model did not return valid JSON.")
+                    return
+                data = json.loads(match.group(0))
+
+            # ensure keys exist
             for i in range(1, 10):
                 data.setdefault(f"s{i}paragraph1", "")
                 data.setdefault(f"s{i}alt1", "")
@@ -130,8 +168,8 @@ def main():
                         continue
 
                     # download to temp, upload raw to S3
-                    _, tmp_path = tempfile.mkstemp(prefix=f"tmp_{idx+1}_", suffix=".jpg")
-                    os.close(_)
+                    fd, tmp_path = tempfile.mkstemp(prefix=f"tmp_{idx+1}_", suffix=".jpg")
+                    os.close(fd)
                     with open(tmp_path, "wb") as f:
                         f.write(requests.get(url_img).content)
 
@@ -151,42 +189,71 @@ def main():
 
             # 4️⃣ Compute timestamps, slug, and URLs
             now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
-            _, slug_nano, canurl, html_filename = generate_slug_and_urls(data["storytitle"])
-
-            raw_url = images.get("s1image1", "")
+            nano, slug_nano, canurl, html_filename = generate_slug_and_urls(data["storytitle"])
+            raw_url   = images.get("s1image1", "")
             pot_image = raw_url  # already resized via CloudFront
+            storyhtmlurl = f"https://stories.suvichaar.org/{html_filename}"
 
             # 5️⃣ Merge everything and render HTML
             html_vars = {
                 **data,
                 **images,
                 **video_context,
-                "Topic":            topic,
-                "lang":             language,
-                "publishedtime":    now_iso,
-                "modifiedtime":     now_iso,
-                "canurl":           canurl,
-                "potraightcoverurl": pot_image
+                "Topic":              topic,
+                "lang":               language,
+                "publishedtime":      now_iso,
+                "modifiedtime":       now_iso,
+                "canurl":             canurl,
+                "potraightcoverurl":  pot_image
             }
             html_content = html_template.render(**html_vars)
 
-            # upload final HTML
+            # ── Upload final HTML ─────────────────────────────────────────────
             s3.put_object(
-                Bucket="suvichaarstories",
+                Bucket=HTML_BUCKET,
                 Key=html_filename,
                 Body=html_content.encode("utf-8"),
                 ContentType="text/html",
             )
 
+            # 5.5️⃣ Build & upload JSON metadata
+            filter_tags = clean_filter_tags(data)
+            story_json = {
+                "story_title":      data.get("storytitle", ""),
+                "categories":       1,
+                "filterTags":       filter_tags,
+                "story_uid":        nano,
+                "story_link":       canurl,
+                "storyhtmlurl":     storyhtmlurl,
+                "urlslug":          slug_nano,
+                "cover_image_link": images.get("s1image1", ""),
+                "publisher_id":     1,
+                "story_logo_link":  f"{CDN_BASE}/filters:resize/96x96/media/brandasset/suvichaariconblack.png",
+                "keywords":         data.get("metakeywords", ""),
+                "metadescription":  data.get("metadescription", ""),
+                "lang":             language
+            }
+            story_json_str = json.dumps(story_json, indent=2, ensure_ascii=False)
+
+
             # 6️⃣ Preview & Download
             st.markdown("### Preview HTML")
             st.components.v1.html(html_content, height=600)
+
             st.markdown(f"🔗 **Live Story URL:** [View your story →]({canurl})")
+
             st.download_button(
                 "Download HTML",
                 html_content,
                 file_name=html_filename,
                 mime="text/html"
+            )
+
+            st.download_button(
+                "Download JSON",
+                story_json_str,
+                file_name=f"{slug_nano}.json",
+                mime="application/json"
             )
 
 if __name__ == "__main__":
